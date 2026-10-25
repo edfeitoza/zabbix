@@ -1,0 +1,112 @@
+services:
+  # ---------- Banco de dados (container separado) ----------
+  mysql-server:
+    image: mysql:8.4
+    container_name: zabbix-mysql
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_bin
+      - --log-bin-trust-function-creators=1
+    environment:
+      MYSQL_DATABASE: "zabbix"
+      MYSQL_USER: "zabbix"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD}"
+      MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      zabbix-net:
+        ipv4_address: 172.20.0.20
+
+  # ---------- Zabbix Server 8.0 ----------
+  zabbix-server-mysql:
+    build: .
+    image: zabbix-server-custom:8.0
+    container_name: zabbix-server-mysql
+    restart: unless-stopped
+    tty: true
+    init: true
+    environment:
+      DB_SERVER_HOST: "mysql-server"
+      MYSQL_USER: "zabbix"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD}"
+    ports:
+      - "10051:10051"
+    depends_on:
+      mysql-server:
+        condition: service_healthy
+    networks:
+      zabbix-net:
+        ipv4_address: 172.20.0.10
+
+  # ---------- Interface Web (Nginx + PHP) ----------
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-mysql:alpine-trunk
+    container_name: zabbix-web
+    restart: unless-stopped
+    environment:
+      ZBX_SERVER_HOST: "zabbix-server-mysql"
+      ZBX_SERVER_PORT: "10051"
+      ZBX_SERVER_NAME: "Zabbix GB"
+      DB_SERVER_HOST: "mysql-server"
+      DB_SERVER_PORT: "3306"
+      MYSQL_DATABASE: "zabbix"
+      MYSQL_USER: "zabbix"
+      MYSQL_PASSWORD: "${MYSQL_PASSWORD}"
+      PHP_TZ: "America/Sao_Paulo"
+    ports:
+      - "${ZBX_WEB_PORT:-8080}:8080"
+    depends_on:
+      mysql-server:
+        condition: service_healthy
+      zabbix-server-mysql:
+        condition: service_started
+    networks:
+      zabbix-net:
+        ipv4_address: 172.20.0.30
+
+  # ---------- Zabbix Agent 2 (monitora o próprio servidor) ----------
+  zabbix-agent:
+    image: zabbix/zabbix-agent2:alpine-trunk
+    container_name: zabbix-agent
+    restart: unless-stopped
+    init: true
+    privileged: true
+    pid: host
+    environment:
+      # Nome do host: deve ser IGUAL ao "Host name" cadastrado no frontend
+      ZBX_HOSTNAME: "Zabbix server"
+      # Server= (checagens passivas: quem pode consultar o agente na 10050)
+      ZBX_PASSIVE_ALLOW: "true"
+      ZBX_PASSIVESERVERS: "zabbix-server-mysql,172.20.0.10"
+      # ServerActive= (checagens ativas: agente envia para o server na 10051)
+      ZBX_ACTIVE_ALLOW: "true"
+      ZBX_ACTIVESERVERS: "zabbix-server-mysql:10051"
+      ZBX_LISTENPORT: "10050"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - zabbix-server-mysql
+    networks:
+      zabbix-net:
+        ipv4_address: 172.20.0.40
+
+volumes:
+  mysql-data:
+    name: zabbix-mysql-data
+
+networks:
+  zabbix-net:
+    name: zabbix-net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
