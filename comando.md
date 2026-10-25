@@ -23,3 +23,13 @@ docker compose logs -f zabbix-server-mysql
 docker exec -it zabbix-mysql mysql -uzabbix -p -e "SHOW TABLES;" zabbix | head
 ```
 ***
+
+# Baixando todos os conatiners ativos
+```bash
+docker compose down
+```
+# Limpando volumes temporarios
+```bash
+docker volume prune -f
+```
+***
