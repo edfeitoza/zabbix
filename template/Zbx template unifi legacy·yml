@@ -1,0 +1,1071 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+  - uuid: 44244a9102834e99b1f211f477f17c9e
+    name: Templates/Network devices
+  templates:
+  - uuid: ef2a805a7cd4402d9fb331da8b240b20
+    template: UniFi Controller Legacy by Script
+    name: UniFi Controller Legacy by Script
+    description: 'Monitora a UniFi Network Application legada (porta 8443) via API com login por cookie.
+
+      Um host por site. Configure {$UNIFI.URL}, {$UNIFI.USER}, {$UNIFI.PASSWORD} e {$UNIFI.SITE}.'
+    groups:
+    - name: Templates/Network devices
+    items:
+    - uuid: 47c73115738445deacfebf135dad94af
+      name: 'UniFi: coleta da API (master)'
+      type: SCRIPT
+      key: unifi.api.get
+      delay: '{$UNIFI.INTERVAL}'
+      history: '0'
+      value_type: TEXT
+      trends: '0'
+      params: |
+        var params = JSON.parse(value);
+        var base = String(params.url || '').replace(/\/+$/, '');
+        var site = params.site || 'default';
+        if (!base) throw 'Macro {$UNIFI.URL} vazia';
+
+        function num(v) {
+            if (v === undefined || v === null || v === '') return undefined;
+            var n = parseFloat(v);
+            return isNaN(n) ? undefined : n;
+        }
+
+        function getSession(req) {
+            var headers = req.getHeaders(true);
+            var list = [], csrf = '';
+            for (var name in headers) {
+                if (name.toLowerCase() !== 'set-cookie') continue;
+                var values = headers[name];
+                if (!Array.isArray(values)) values = [values];
+                for (var i = 0; i < values.length; i++) {
+                    var pair = String(values[i]).split(';')[0];
+                    list.push(pair);
+                    if (pair.indexOf('csrf_token=') === 0) csrf = pair.substring(11);
+                }
+            }
+            return { cookie: list.join('; '), csrf: csrf };
+        }
+
+        function apiGet(req, path) {
+            var resp = req.get(base + path);
+            var status = req.getStatus();
+            if (status != 200) throw 'GET ' + path + ' retornou HTTP ' + status;
+            var data = JSON.parse(resp);
+            if (!data.meta || data.meta.rc !== 'ok')
+                throw 'GET ' + path + ' falhou: ' + (data.meta ? data.meta.msg : 'resposta inesperada');
+            return data.data || [];
+        }
+
+        var req = new HttpRequest();
+        req.addHeader('Content-Type: application/json');
+        req.addHeader('Accept: application/json');
+        var loginResp = req.post(base + '/api/login',
+            JSON.stringify({ username: params.user, password: params.password, remember: false }));
+        if (req.getStatus() != 200)
+            throw 'Falha no login (HTTP ' + req.getStatus() + '): ' + String(loginResp).substring(0, 200);
+
+        var session = getSession(req);
+        if (session.cookie.indexOf('unifises=') === -1)
+            throw 'Login sem cookie unifises (controladora nao e legada ou credencial invalida)';
+
+        req.clearHeader();
+        req.addHeader('Accept: application/json');
+        req.addHeader('Content-Type: application/json');
+        req.addHeader('Cookie: ' + session.cookie);
+        if (session.csrf) req.addHeader('X-Csrf-Token: ' + session.csrf);
+
+        var result = {
+            devices: [],
+            summary: { total: 0, connected: 0, disconnected: 0, upgradable: 0 },
+            health: {},
+            controller: {}
+        };
+        var s = encodeURIComponent(site);
+
+        try {
+            var raw = apiGet(req, '/api/s/' + s + '/stat/device');
+            for (var i = 0; i < raw.length; i++) {
+                var d = raw[i], ss = d['system-stats'] || {};
+                var state = (d.state === undefined || d.state === null) ? 0 : d.state;
+                var dev = {
+                    mac: d.mac,
+                    name: d.name || d.hostname || d.mac,
+                    model: d.model || '',
+                    type: d.type || '',
+                    ip: d.ip || '',
+                    version: d.version || '',
+                    state: state,
+                    upgradable: d.upgradable ? 1 : 0,
+                    uptime: num(d.uptime),
+                    clients: num(d.num_sta),
+                    cpu: num(ss.cpu),
+                    mem: num(ss.mem),
+                    tx_bytes: num(d.tx_bytes),
+                    rx_bytes: num(d.rx_bytes),
+                    satisfaction: num(d.satisfaction),
+                    temperature: num(d.general_temperature)
+                };
+                result.devices.push(dev);
+                result.summary.total++;
+                if (state == 1) result.summary.connected++; else result.summary.disconnected++;
+                if (dev.upgradable) result.summary.upgradable++;
+            }
+
+            var codes = { ok: 1, warning: 2, error: 3 };
+            var health = apiGet(req, '/api/s/' + s + '/stat/health');
+            for (var j = 0; j < health.length; j++) {
+                var h = health[j];
+                result.health[h.subsystem] = {
+                    status: codes[h.status] || 0,
+                    users: num(h.num_user),
+                    guests: num(h.num_guest),
+                    adopted: num(h.num_adopted),
+                    disconnected: num(h.num_disconnected),
+                    pending: num(h.num_pending),
+                    latency: num(h.latency),
+                    xput_up: num(h.xput_up),
+                    xput_down: num(h.xput_down)
+                };
+            }
+
+            try {
+                var sys = apiGet(req, '/api/s/' + s + '/stat/sysinfo');
+                if (sys.length) {
+                    result.controller.version = sys[0].version || '';
+                    result.controller.update_available = sys[0].update_available ? 1 : 0;
+                }
+            } catch (e) { }
+        }
+        finally {
+            try { req.post(base + '/api/logout', '{}'); } catch (e) { }
+        }
+
+        return JSON.stringify(result);
+      description: Faz login na controladora legada (/api/login), coleta stat/device, stat/health e stat/sysinfo do site {$UNIFI.SITE} e faz logout. Todos os demais itens dependem deste.
+      timeout: '{$UNIFI.TIMEOUT}'
+      parameters:
+      - name: url
+        value: '{$UNIFI.URL}'
+      - name: user
+        value: '{$UNIFI.USER}'
+      - name: password
+        value: '{$UNIFI.PASSWORD}'
+      - name: site
+        value: '{$UNIFI.SITE}'
+      tags:
+      - tag: component
+        value: raw
+    - uuid: 5739f43a028a458e90ddd2023a741c26
+      name: 'UniFi: status da controladora (raw)'
+      type: HTTP_AGENT
+      key: unifi.controller.status
+      delay: 1m
+      history: '0'
+      value_type: TEXT
+      trends: '0'
+      url: '{$UNIFI.URL}/status'
+      timeout: '{$UNIFI.TIMEOUT}'
+      description: Endpoint /status da controladora legada, sem autenticação.
+      tags:
+      - tag: component
+        value: raw
+    - uuid: c4f63cbfa16140499f96c1cc55d43a5c
+      name: 'UniFi: controladora no ar'
+      type: DEPENDENT
+      key: unifi.controller.up
+      delay: '0'
+      history: 90d
+      value_type: UNSIGNED
+      valuemap:
+        name: UniFi Yes/No
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.meta.up
+      - type: BOOL_TO_DECIMAL
+        parameters:
+        - ''
+      master_item: &id001
+        key: unifi.controller.status
+      tags:
+      - tag: component
+        value: controller
+      triggers:
+      - uuid: 4d7bf8143d5d4662ba509f57cd54b01c
+        expression: max(/UniFi Controller Legacy by Script/unifi.controller.up,#3)=0 or nodata(/UniFi Controller Legacy by Script/unifi.controller.up,{$UNIFI.NODATA.TIMEOUT})=1
+        name: 'UniFi: controladora inacessível ({$UNIFI.URL})'
+        priority: HIGH
+        description: O endpoint /status não respondeu up=true nas últimas 3 coletas ou está sem dados.
+        tags:
+        - tag: scope
+          value: availability
+    - uuid: 8e8043b82ab7443ab34466c1d8a09783
+      name: 'UniFi: versão da controladora'
+      type: DEPENDENT
+      key: unifi.controller.version
+      delay: '0'
+      history: 90d
+      value_type: CHAR
+      trends: '0'
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.meta.server_version
+        error_handler: DISCARD_VALUE
+      - &id005
+        type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 1d
+      master_item: *id001
+      tags:
+      - tag: component
+        value: controller
+      triggers:
+      - uuid: 1e867a58c0084cdf9196cd4be9ac3472
+        expression: last(/UniFi Controller Legacy by Script/unifi.controller.version,#1)<>last(/UniFi Controller Legacy by Script/unifi.controller.version,#2) and length(last(/UniFi Controller Legacy by Script/unifi.controller.version))>0
+        name: 'UniFi: versão da controladora alterada'
+        priority: INFO
+        manual_close: 'YES'
+        tags:
+        - tag: scope
+          value: notice
+    - uuid: 105bb35645384de2ba65e5666785946a
+      name: 'UniFi: atualização da controladora disponível'
+      type: DEPENDENT
+      key: unifi.controller.update_available
+      delay: '0'
+      history: 7d
+      value_type: UNSIGNED
+      valuemap:
+        name: UniFi Yes/No
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.controller.update_available
+        error_handler: DISCARD_VALUE
+      master_item: &id002
+        key: unifi.api.get
+      tags:
+      - tag: component
+        value: controller
+      triggers:
+      - uuid: 980a525e2d9c49a5b783b22f9b928729
+        expression: last(/UniFi Controller Legacy by Script/unifi.controller.update_available)=1
+        name: 'UniFi: atualização da controladora disponível'
+        priority: INFO
+        manual_close: 'YES'
+        dependencies: &id004
+        - &id003
+          name: 'UniFi: controladora inacessível ({$UNIFI.URL})'
+          expression: max(/UniFi Controller Legacy by Script/unifi.controller.up,#3)=0 or nodata(/UniFi Controller Legacy by Script/unifi.controller.up,{$UNIFI.NODATA.TIMEOUT})=1
+        - name: 'UniFi: API sem dados (falha de login ou script)'
+          expression: nodata(/UniFi Controller Legacy by Script/unifi.devices.total,{$UNIFI.NODATA.TIMEOUT})=1
+        tags:
+        - tag: scope
+          value: notice
+    - uuid: dff8744f2d804e0fa00cec0e6931a8fe
+      name: 'UniFi: dispositivos (total)'
+      type: DEPENDENT
+      key: unifi.devices.total
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.total
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      triggers:
+      - uuid: 3599e02dd900467f89fb42e70dc29b91
+        expression: nodata(/UniFi Controller Legacy by Script/unifi.devices.total,{$UNIFI.NODATA.TIMEOUT})=1
+        name: 'UniFi: API sem dados (falha de login ou script)'
+        priority: AVERAGE
+        description: 'O item master não retornou dados. Verifique credenciais ({$UNIFI.USER}), site ({$UNIFI.SITE}) e o erro do item "UniFi: coleta da API (master)".'
+        dependencies:
+        - *id003
+        tags:
+        - tag: scope
+          value: availability
+    - uuid: 225e6e662c3445868fe6be71d099d167
+      name: 'UniFi: dispositivos conectados'
+      type: DEPENDENT
+      key: unifi.devices.connected
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.connected
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+    - uuid: dc6964da3fae4511a715398724b53c2d
+      name: 'UniFi: dispositivos desconectados'
+      type: DEPENDENT
+      key: unifi.devices.disconnected
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.disconnected
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+    - uuid: d343eb853719439996c314b83af35359
+      name: 'UniFi: dispositivos com firmware pendente'
+      type: DEPENDENT
+      key: unifi.devices.upgradable
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.summary.upgradable
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+    - uuid: c0fe4db069fc41e48177ff32cbd89686
+      name: 'UniFi: status WLAN'
+      type: DEPENDENT
+      key: unifi.site.status[wlan]
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      valuemap:
+        name: UniFi health status
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.wlan.status
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: wlan
+      triggers:
+      - uuid: 1ce2b0c08c0349929cb5c063f161c61f
+        expression: last(/UniFi Controller Legacy by Script/unifi.site.status[wlan])=3
+        name: 'UniFi: subsistema WLAN em erro (site {$UNIFI.SITE})'
+        priority: AVERAGE
+        dependencies: *id004
+        tags:
+        - tag: scope
+          value: availability
+    - uuid: 205e27f5d9a9444698eedf1ec8437f4e
+      name: 'UniFi: status LAN'
+      type: DEPENDENT
+      key: unifi.site.status[lan]
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      valuemap:
+        name: UniFi health status
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.lan.status
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: lan
+      triggers:
+      - uuid: f7f7a7d844bf4c069e6055eaf6cf92bf
+        expression: last(/UniFi Controller Legacy by Script/unifi.site.status[lan])=3
+        name: 'UniFi: subsistema LAN em erro (site {$UNIFI.SITE})'
+        priority: AVERAGE
+        dependencies: *id004
+        tags:
+        - tag: scope
+          value: availability
+    - uuid: 13702e533f0a493bba51951d045761fd
+      name: 'UniFi: status WAN'
+      type: DEPENDENT
+      key: unifi.site.status[wan]
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      valuemap:
+        name: UniFi health status
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.wan.status
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: wan
+      triggers:
+      - uuid: 14227461ea1b46bbbc02cb6a15297485
+        expression: last(/UniFi Controller Legacy by Script/unifi.site.status[wan])=3
+        name: 'UniFi: subsistema WAN em erro (site {$UNIFI.SITE})'
+        priority: HIGH
+        dependencies: *id004
+        tags:
+        - tag: scope
+          value: availability
+    - uuid: d4c710698aee4c08bf23eeaa86884d96
+      name: 'UniFi: status Internet'
+      type: DEPENDENT
+      key: unifi.site.status[www]
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      valuemap:
+        name: UniFi health status
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.www.status
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: www
+      triggers:
+      - uuid: a72f4915b42542c680adeb983d51e21e
+        expression: last(/UniFi Controller Legacy by Script/unifi.site.status[www])=3
+        name: 'UniFi: subsistema Internet em erro (site {$UNIFI.SITE})'
+        priority: WARNING
+        dependencies: *id004
+        tags:
+        - tag: scope
+          value: availability
+    - uuid: 891ca9cf918f4682b7fa93cdedd37eb8
+      name: 'UniFi: clientes Wi-Fi'
+      type: DEPENDENT
+      key: unifi.site.users[wlan]
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.wlan.users
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: wlan
+    - uuid: b767af14e55c432a8f5c4a5585cf9697
+      name: 'UniFi: convidados Wi-Fi'
+      type: DEPENDENT
+      key: unifi.site.guests[wlan]
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.wlan.guests
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: wlan
+    - uuid: ea0841ce20e747ae82e9149ddf0439bc
+      name: 'UniFi: clientes cabeados'
+      type: DEPENDENT
+      key: unifi.site.users[lan]
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.lan.users
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: lan
+    - uuid: 62c774fb124e461eaddc76bfb04d1765
+      name: 'UniFi: APs desconectados (health)'
+      type: DEPENDENT
+      key: unifi.site.disconnected[wlan]
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.wlan.disconnected
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: wlan
+    - uuid: aa7beadaddcd49dab33405b42c42d680
+      name: 'UniFi: APs pendentes de adoção'
+      type: DEPENDENT
+      key: unifi.site.pending[wlan]
+      delay: '0'
+      history: 30d
+      value_type: UNSIGNED
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.wlan.pending
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: wlan
+    - uuid: 662c40c9e1b3487893783055c928bf51
+      name: 'UniFi: latência Internet'
+      type: DEPENDENT
+      key: unifi.site.www.latency
+      delay: '0'
+      history: 30d
+      value_type: FLOAT
+      units: ms
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.www.latency
+        error_handler: DISCARD_VALUE
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: www
+    - uuid: a55796033e5847498722fa2a58a87b1a
+      name: 'UniFi: speedtest download'
+      type: DEPENDENT
+      key: unifi.site.www.down
+      delay: '0'
+      history: 30d
+      value_type: FLOAT
+      units: bps
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.www.xput_down
+        error_handler: DISCARD_VALUE
+      - type: MULTIPLIER
+        parameters:
+        - '1000000'
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: www
+    - uuid: 73cb4737cd6340669259ba3a64524e7d
+      name: 'UniFi: speedtest upload'
+      type: DEPENDENT
+      key: unifi.site.www.up
+      delay: '0'
+      history: 30d
+      value_type: FLOAT
+      units: bps
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.health.www.xput_up
+        error_handler: DISCARD_VALUE
+      - type: MULTIPLIER
+        parameters:
+        - '1000000'
+      master_item: *id002
+      tags:
+      - tag: component
+        value: site
+      - tag: subsystem
+        value: www
+    discovery_rules:
+    - uuid: 5f1d4bf18f0e44db93c13caa31fbf97b
+      name: 'UniFi: descoberta de dispositivos'
+      type: DEPENDENT
+      key: unifi.device.discovery
+      delay: '0'
+      lifetime: 7d
+      description: Descobre APs (uap), switches (usw) e gateways (ugw) adotados no site {$UNIFI.SITE}.
+      filter:
+        evaltype: AND
+        conditions:
+        - macro: '{#TYPE}'
+          value: '{$UNIFI.LLD.TYPE.MATCHES}'
+          formulaid: A
+        - macro: '{#NAME}'
+          value: '{$UNIFI.LLD.NAME.NOT_MATCHES}'
+          operator: NOT_MATCHES_REGEX
+          formulaid: B
+      item_prototypes:
+      - uuid: a82d8b9a433d4460a6c536d57e3ebd82
+        name: '{#NAME}: estado'
+        type: DEPENDENT
+        key: unifi.device.state[{#MAC}]
+        delay: '0'
+        history: 90d
+        value_type: UNSIGNED
+        valuemap:
+          name: UniFi device state
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].state.first()
+        master_item: *id002
+        tags:
+        - tag: component
+          value: device
+        - tag: device
+          value: '{#NAME}'
+        trigger_prototypes:
+        - uuid: 08b2bc0fd3a440069bd34ec701adb4d8
+          expression: count(/UniFi Controller Legacy by Script/unifi.device.state[{#MAC}],{$UNIFI.OFFLINE.PERIOD},"eq","1")=0 and count(/UniFi Controller Legacy by Script/unifi.device.state[{#MAC}],{$UNIFI.OFFLINE.PERIOD})>0
+          name: 'UniFi: {#NAME} ({#MODEL}) não conectado à controladora'
+          priority: HIGH
+          recovery_mode: RECOVERY_EXPRESSION
+          recovery_expression: last(/UniFi Controller Legacy by Script/unifi.device.state[{#MAC}])=1
+          description: 'Nenhuma leitura com estado "Conectado" em {$UNIFI.OFFLINE.PERIOD}. IP: {#IP}, MAC: {#MAC}.'
+          dependencies: *id004
+          tags:
+          - tag: scope
+            value: availability
+      - uuid: 21d0e724f6934ecbac169f7fc4a095f7
+        name: '{#NAME}: uptime'
+        type: DEPENDENT
+        key: unifi.device.uptime[{#MAC}]
+        delay: '0'
+        history: 30d
+        value_type: UNSIGNED
+        units: uptime
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].uptime.first()
+          error_handler: DISCARD_VALUE
+        master_item: *id002
+        tags:
+        - tag: component
+          value: device
+        - tag: device
+          value: '{#NAME}'
+        trigger_prototypes:
+        - uuid: d34748b573d54fa59eef2e320192f28c
+          expression: last(/UniFi Controller Legacy by Script/unifi.device.uptime[{#MAC}])<{$UNIFI.UPTIME.MIN}
+          name: 'UniFi: {#NAME} foi reiniciado'
+          priority: WARNING
+          manual_close: 'YES'
+          dependencies: *id004
+          tags:
+          - tag: scope
+            value: notice
+      - uuid: c393ea29e149423d84936b74296ed058
+        name: '{#NAME}: clientes'
+        type: DEPENDENT
+        key: unifi.device.clients[{#MAC}]
+        delay: '0'
+        history: 30d
+        value_type: UNSIGNED
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].clients.first()
+          error_handler: DISCARD_VALUE
+        master_item: *id002
+        tags:
+        - tag: component
+          value: clients
+        - tag: device
+          value: '{#NAME}'
+      - uuid: 88bee373ed7e439bafb43ad3ce5d6b72
+        name: '{#NAME}: CPU'
+        type: DEPENDENT
+        key: unifi.device.cpu[{#MAC}]
+        delay: '0'
+        history: 30d
+        value_type: FLOAT
+        units: '%'
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].cpu.first()
+          error_handler: DISCARD_VALUE
+        master_item: *id002
+        tags:
+        - tag: component
+          value: cpu
+        - tag: device
+          value: '{#NAME}'
+        trigger_prototypes:
+        - uuid: 403f88c1450d47618e3e7f90e4a03536
+          expression: min(/UniFi Controller Legacy by Script/unifi.device.cpu[{#MAC}],15m)>{$UNIFI.CPU.MAX}
+          name: 'UniFi: {#NAME} com CPU alta (>{$UNIFI.CPU.MAX}% por 15m)'
+          priority: WARNING
+          dependencies: *id004
+          tags:
+          - tag: scope
+            value: performance
+      - uuid: 3356e1ac4d58485a95d134f236849205
+        name: '{#NAME}: memória'
+        type: DEPENDENT
+        key: unifi.device.mem[{#MAC}]
+        delay: '0'
+        history: 30d
+        value_type: FLOAT
+        units: '%'
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].mem.first()
+          error_handler: DISCARD_VALUE
+        master_item: *id002
+        tags:
+        - tag: component
+          value: memory
+        - tag: device
+          value: '{#NAME}'
+        trigger_prototypes:
+        - uuid: 07fa57d989f94a329d8754965b671556
+          expression: min(/UniFi Controller Legacy by Script/unifi.device.mem[{#MAC}],15m)>{$UNIFI.MEM.MAX}
+          name: 'UniFi: {#NAME} com memória alta (>{$UNIFI.MEM.MAX}% por 15m)'
+          priority: WARNING
+          dependencies: *id004
+          tags:
+          - tag: scope
+            value: performance
+      - uuid: 468085c5df6140f69fc833082f62d1f7
+        name: '{#NAME}: tráfego TX'
+        type: DEPENDENT
+        key: unifi.device.tx[{#MAC}]
+        delay: '0'
+        history: 30d
+        value_type: FLOAT
+        units: bps
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].tx_bytes.first()
+          error_handler: DISCARD_VALUE
+        - type: CHANGE_PER_SECOND
+          parameters:
+          - ''
+        - type: MULTIPLIER
+          parameters:
+          - '8'
+        master_item: *id002
+        tags:
+        - tag: component
+          value: network
+        - tag: device
+          value: '{#NAME}'
+      - uuid: a26608b373d84af0890a4e0d42af6f1b
+        name: '{#NAME}: tráfego RX'
+        type: DEPENDENT
+        key: unifi.device.rx[{#MAC}]
+        delay: '0'
+        history: 30d
+        value_type: FLOAT
+        units: bps
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].rx_bytes.first()
+          error_handler: DISCARD_VALUE
+        - type: CHANGE_PER_SECOND
+          parameters:
+          - ''
+        - type: MULTIPLIER
+          parameters:
+          - '8'
+        master_item: *id002
+        tags:
+        - tag: component
+          value: network
+        - tag: device
+          value: '{#NAME}'
+      - uuid: 8e72dc6aba4649398cb0f642e5fa01bc
+        name: '{#NAME}: satisfação Wi-Fi'
+        type: DEPENDENT
+        key: unifi.device.satisfaction[{#MAC}]
+        delay: '0'
+        history: 30d
+        value_type: FLOAT
+        units: '%'
+        description: Disponível apenas em APs.
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].satisfaction.first()
+          error_handler: DISCARD_VALUE
+        master_item: *id002
+        tags:
+        - tag: component
+          value: wifi
+        - tag: device
+          value: '{#NAME}'
+      - uuid: fbba3616878948aba6719202570a1400
+        name: '{#NAME}: temperatura'
+        type: DEPENDENT
+        key: unifi.device.temperature[{#MAC}]
+        delay: '0'
+        history: 30d
+        value_type: FLOAT
+        units: °C
+        description: Disponível apenas em modelos com sensor.
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].temperature.first()
+          error_handler: DISCARD_VALUE
+        master_item: *id002
+        tags:
+        - tag: component
+          value: temperature
+        - tag: device
+          value: '{#NAME}'
+      - uuid: bfb73004ad57410a8eff65991ab3d3a7
+        name: '{#NAME}: firmware'
+        type: DEPENDENT
+        key: unifi.device.version[{#MAC}]
+        delay: '0'
+        history: 90d
+        value_type: CHAR
+        trends: '0'
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].version.first()
+          error_handler: DISCARD_VALUE
+        - *id005
+        master_item: *id002
+        tags:
+        - tag: component
+          value: firmware
+        - tag: device
+          value: '{#NAME}'
+        trigger_prototypes:
+        - uuid: 4fe6377d4b8f488a8d65df2e2e64c5c0
+          expression: last(/UniFi Controller Legacy by Script/unifi.device.version[{#MAC}],#1)<>last(/UniFi Controller Legacy by Script/unifi.device.version[{#MAC}],#2) and length(last(/UniFi Controller Legacy by Script/unifi.device.version[{#MAC}]))>0
+          name: 'UniFi: firmware de {#NAME} alterado'
+          priority: INFO
+          manual_close: 'YES'
+          tags:
+          - tag: scope
+            value: notice
+      - uuid: 8e3b7fdc6b0440849395a62d4776ba71
+        name: '{#NAME}: upgrade de firmware disponível'
+        type: DEPENDENT
+        key: unifi.device.upgradable[{#MAC}]
+        delay: '0'
+        history: 7d
+        value_type: UNSIGNED
+        valuemap:
+          name: UniFi Yes/No
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].upgradable.first()
+        master_item: *id002
+        tags:
+        - tag: component
+          value: firmware
+        - tag: device
+          value: '{#NAME}'
+        trigger_prototypes:
+        - uuid: 469370436b554c34ac6aaa4ae757ce21
+          expression: last(/UniFi Controller Legacy by Script/unifi.device.upgradable[{#MAC}])=1
+          name: 'UniFi: firmware disponível para {#NAME}'
+          priority: INFO
+          manual_close: 'YES'
+          dependencies: *id004
+          tags:
+          - tag: scope
+            value: notice
+      - uuid: b6ebbcf3ba8048f19a5ac44d9c4d226b
+        name: '{#NAME}: endereço IP'
+        type: DEPENDENT
+        key: unifi.device.ip[{#MAC}]
+        delay: '0'
+        history: 30d
+        value_type: CHAR
+        trends: '0'
+        preprocessing:
+        - type: JSONPATH
+          parameters:
+          - $.devices[?(@.mac=='{#MAC}')].ip.first()
+          error_handler: DISCARD_VALUE
+        - *id005
+        master_item: *id002
+        tags:
+        - tag: component
+          value: device
+        - tag: device
+          value: '{#NAME}'
+      graph_prototypes:
+      - uuid: 595456020cc347478ca4f81ba68666d9
+        name: '{#NAME}: tráfego'
+        graph_items:
+        - sortorder: '0'
+          color: 199C0D
+          item:
+            host: UniFi Controller Legacy by Script
+            key: unifi.device.rx[{#MAC}]
+        - sortorder: '1'
+          color: F63100
+          item:
+            host: UniFi Controller Legacy by Script
+            key: unifi.device.tx[{#MAC}]
+      - uuid: 9f2faeddcc9345fcb2b9b66ead1b6aaf
+        name: '{#NAME}: CPU e memória'
+        graph_items:
+        - sortorder: '0'
+          color: 2774A4
+          item:
+            host: UniFi Controller Legacy by Script
+            key: unifi.device.cpu[{#MAC}]
+        - sortorder: '1'
+          color: F7941D
+          item:
+            host: UniFi Controller Legacy by Script
+            key: unifi.device.mem[{#MAC}]
+      - uuid: 3fc56f2d5652449a9841721677a44ca4
+        name: '{#NAME}: clientes'
+        graph_items:
+        - sortorder: '0'
+          color: 1A7C11
+          item:
+            host: UniFi Controller Legacy by Script
+            key: unifi.device.clients[{#MAC}]
+      master_item: *id002
+      lld_macro_paths:
+      - lld_macro: '{#MAC}'
+        path: $.mac
+      - lld_macro: '{#NAME}'
+        path: $.name
+      - lld_macro: '{#MODEL}'
+        path: $.model
+      - lld_macro: '{#TYPE}'
+        path: $.type
+      - lld_macro: '{#IP}'
+        path: $.ip
+      preprocessing:
+      - type: JSONPATH
+        parameters:
+        - $.devices
+    tags:
+    - tag: class
+      value: network
+    - tag: target
+      value: unifi
+    macros:
+    - macro: '{$UNIFI.URL}'
+      value: https://unifi.exemplo.local:8443
+      description: URL base da controladora legada, sem barra no final.
+    - macro: '{$UNIFI.USER}'
+      value: zabbix
+      description: Usuário local somente leitura na controladora.
+    - macro: '{$UNIFI.PASSWORD}'
+      type: SECRET_TEXT
+      description: Senha do usuário de monitoramento.
+    - macro: '{$UNIFI.SITE}'
+      value: default
+      description: ID interno do site (não o nome exibido). Veja /api/self/sites.
+    - macro: '{$UNIFI.INTERVAL}'
+      value: 2m
+      description: Intervalo de coleta do item master.
+    - macro: '{$UNIFI.TIMEOUT}'
+      value: 30s
+      description: Timeout do script e do HTTP agent.
+    - macro: '{$UNIFI.NODATA.TIMEOUT}'
+      value: 10m
+      description: Tempo sem dados para alertar controladora/API.
+    - macro: '{$UNIFI.OFFLINE.PERIOD}'
+      value: 6m
+      description: Período sem estado Conectado para alertar dispositivo offline.
+    - macro: '{$UNIFI.UPTIME.MIN}'
+      value: '600'
+      description: Uptime (s) abaixo do qual o dispositivo é considerado reiniciado.
+    - macro: '{$UNIFI.CPU.MAX}'
+      value: '90'
+      description: Limite de CPU (%).
+    - macro: '{$UNIFI.MEM.MAX}'
+      value: '90'
+      description: Limite de memória (%).
+    - macro: '{$UNIFI.LLD.TYPE.MATCHES}'
+      value: ^(uap|usw|ugw|udm|uxg)$
+      description: Tipos de dispositivo descobertos.
+    - macro: '{$UNIFI.LLD.NAME.NOT_MATCHES}'
+      value: CHANGE_IF_NEEDED
+      description: Regex de nomes a ignorar na descoberta.
+    valuemaps:
+    - uuid: 0158de214b904038b3792002d638f396
+      name: UniFi device state
+      mappings:
+      - value: '0'
+        newvalue: Desconectado
+      - value: '1'
+        newvalue: Conectado
+      - value: '2'
+        newvalue: Pendente de adoção
+      - value: '3'
+        newvalue: Firmware incompatível
+      - value: '4'
+        newvalue: Atualizando
+      - value: '5'
+        newvalue: Provisionando
+      - value: '6'
+        newvalue: Heartbeat perdido
+      - value: '7'
+        newvalue: Adotando
+      - value: '8'
+        newvalue: Removendo
+      - value: '9'
+        newvalue: Erro de inform
+      - value: '10'
+        newvalue: Falha na adoção
+      - value: '11'
+        newvalue: Isolado
+    - uuid: 3780f3577d2d4138b711adcc87e9ef32
+      name: UniFi health status
+      mappings:
+      - value: '0'
+        newvalue: Desconhecido
+      - value: '1'
+        newvalue: OK
+      - value: '2'
+        newvalue: Alerta
+      - value: '3'
+        newvalue: Erro
+    - uuid: 74360dcadf6e4307b8c0e71826584455
+      name: UniFi Yes/No
+      mappings:
+      - value: '0'
+        newvalue: Não
+      - value: '1'
+        newvalue: Sim
