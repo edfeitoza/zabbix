@@ -1,4 +1,4 @@
-***Comandos para consulta no servidor Unifi
+Comandos para consulta no servidor Unifi
 
 Teste a conectividade do usuario e senha nos servidor
 ```bash
